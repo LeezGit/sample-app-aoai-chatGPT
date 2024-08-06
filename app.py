@@ -1,10 +1,4 @@
 import copy
-from azure.cognitiveservices.vision.computervision import ComputerVisionClient
-from azure.cognitiveservices.speech import SpeechConfig, SpeechRecognizer
-from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
-from msrest.authentication import CognitiveServicesCredentials
-from dotenv import load_dotenv
 import json
 import os
 import logging
@@ -46,29 +40,6 @@ bp = Blueprint("routes", __name__, static_folder="static", template_folder="stat
 
 cosmos_db_ready = asyncio.Event()
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Initialize Cognitive Services Clients
-vision_subscription_key = os.getenv('AZURE_AISERVICES_KEY')
-vision_endpoint = os.getenv('AZURE_AISERVICES_COGNITIVESERVICES_ENDPOINT')
-speech_key = os.getenv('AZURE_AISERVICES_KEY')
-speech_endpoint = os.getenv('AZURE_AISERVICES_SPEECH_ENDPOINT')
-search_service_name = os.getenv('AZURE_SEARCH_SERVICE')
-search_key = os.getenv('AZURE_SEARCH_KEY')
-
-if not vision_subscription_key or not vision_endpoint:
-    raise ValueError("Environment variables for Vision Cognitive Services are not set.")
-
-if not speech_key or not speech_endpoint:
-    raise ValueError("Environment variables for Speech Cognitive Services are not set.")
-
-if not search_service_name or not search_key:
-    raise ValueError("Environment variables for Search Cognitive Services are not set.")
-
-computervision_client = ComputerVisionClient(vision_endpoint, CognitiveServicesCredentials(vision_subscription_key))
-speech_config = SpeechConfig(subscription=speech_key, endpoint=speech_endpoint)
-search_client = SearchClient(endpoint=f"https://{search_service_name}.search.windows.net", index_name="your-index-name", credential=search_key)
 
 def create_app():
     app = Quart(__name__)
@@ -131,7 +102,7 @@ frontend_settings = {
         "show_share_button": app_settings.ui.show_share_button,
         "show_chat_history_button": app_settings.ui.show_chat_history_button,
     },
-    "sanitize_answer": app_settings.base_settings.sanitize_answer,
+
 }
 
 
@@ -361,18 +332,7 @@ async def send_chat_request(request_body, request_headers):
             
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
-
-    try:
-        azure_openai_client = await init_openai_client()
-        raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
-        response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id") 
-    except Exception as e:
-        logging.exception("Exception in send_chat_request")
-        raise e
-
-    return response, apim_request_id
-
+i
 
 async def complete_chat_request(request_body, request_headers):
     if app_settings.base_settings.use_promptflow:
@@ -418,11 +378,13 @@ async def conversation_internal(request_body, request_headers):
         if hasattr(ex, "status_code"):
             return jsonify({"error": str(ex)}), ex.status_code
         else:
-            return jsonify({"error": str(ex)}), 500,
-    @bp.route("/conversation", methods=["POST"])
-    async def conversation():
-        if not request.is_json:
-            return jsonify({"error": "request must be json"}), 415
+            return jsonify({"error": str(ex)}), 500
+
+
+@bp.route("/conversation", methods=["POST"])
+async def conversation():
+    if not request.is_json:
+        return jsonify({"error": "request must be json"}), 415
     request_json = await request.get_json()
 
     return await conversation_internal(request_json, request.headers)
@@ -456,7 +418,7 @@ async def add_conversation():
         # check for the conversation_id, if the conversation is not set, we will create a new one
         history_metadata = {}
         if not conversation_id:
-            title = await request_json
+            title = await generate_title(request_json["messages"])
             conversation_dict = await current_app.cosmos_conversation_client.create_conversation(
                 user_id=user_id, title=title
             )
@@ -835,4 +797,66 @@ async def clear_messages():
 
 @bp.route("/history/ensure", methods=["GET"])
 async def ensure_cosmos():
-    await cosmos_db_ready.wait
+    await cosmos_db_ready.wait()
+    if not app_settings.chat_history:
+        return jsonify({"error": "CosmosDB is not configured"}), 404
+
+    try:
+        success, err = await current_app.cosmos_conversation_client.ensure()
+        if not current_app.cosmos_conversation_client or not success:
+            if err:
+                return jsonify({"error": err}), 422
+            return jsonify({"error": "CosmosDB is not configured or not working"}), 500
+
+        return jsonify({"message": "CosmosDB is configured and working"}), 200
+    except Exception as e:
+        logging.exception("Exception in /history/ensure")
+        cosmos_exception = str(e)
+        if "Invalid credentials" in cosmos_exception:
+            return jsonify({"error": cosmos_exception}), 401
+        elif "Invalid CosmosDB database name" in cosmos_exception:
+            return (
+                jsonify(
+                    {
+                        "error": f"{cosmos_exception} {app_settings.chat_history.database} for account {app_settings.chat_history.account}"
+                    }
+                ),
+                422,
+            )
+        elif "Invalid CosmosDB container name" in cosmos_exception:
+            return (
+                jsonify(
+                    {
+                        "error": f"{cosmos_exception}: {app_settings.chat_history.conversations_container}"
+                    }
+                ),
+                422,
+            )
+        else:
+            return jsonify({"error": "CosmosDB is not working"}), 500
+
+
+async def generate_title(conversation_messages) -> str:
+    ## make sure the messages are sorted by _ts descending
+    title_prompt = "Summarize the conversation so far into a 4-word or less title. Do not use any quotation marks or punctuation. Do not include any other commentary or description."
+
+    messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in conversation_messages
+    ]
+    messages.append({"role": "user", "content": title_prompt})
+
+    try:
+        azure_openai_client = await init_openai_client()
+        response = await azure_openai_client.chat.completions.create(
+            model=app_settings.azure_openai.model, messages=messages, temperature=1, max_tokens=64
+        )
+
+        title = response.choices[0].message.content
+        return title
+    except Exception as e:
+        logging.exception("Exception while generating title", e)
+        return messages[-2]["content"]
+
+
+app = create_app()
